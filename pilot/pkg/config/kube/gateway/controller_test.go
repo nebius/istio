@@ -15,6 +15,7 @@
 package gateway
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	k8s "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/config/kube/crdclient"
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
@@ -33,11 +35,13 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -138,6 +142,77 @@ func TestListGatewayResourceType(t *testing.T) {
 		g.Expect(c.Namespace).To(Equal("ns1"))
 		g.Expect(c.Spec).To(Equal(expectedgw))
 	}
+}
+
+func TestGatewayConfigSurvivesRevisionChange(t *testing.T) {
+	g := NewWithT(t)
+	clientSet := kube.NewFakeClient()
+	clienttest.MakeCRD(t, clientSet, collections.GatewayClass.GroupVersionResource())
+	clienttest.MakeCRD(t, clientSet, collections.KubernetesGateway.GroupVersionResource())
+
+	schemas := collection.NewSchemasBuilder().
+		MustAdd(collections.GatewayClass).
+		MustAdd(collections.KubernetesGateway).
+		Build()
+	store := crdclient.NewForSchemas(clientSet, crdclient.Option{Revision: "default"}, schemas)
+	controller := NewController(clientSet, store, AlwaysReady, nil, controller.Options{})
+
+	stop := test.NewStop(t)
+	clientSet.RunAndWait(stop)
+	go store.Run(stop)
+	kube.WaitForCacheSync("test", stop, store.HasSynced)
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.GatewayClass,
+			Name:             "gwclass",
+		},
+		Spec: gatewayClassSpec,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.KubernetesGateway,
+			Name:             "gwspec",
+			Namespace:        "ns1",
+		},
+		Spec: gatewaySpec,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry.UntilSuccessOrFail(t, func() error {
+		if store.Get(gvk.KubernetesGateway, "gwspec", "ns1") == nil {
+			return fmt.Errorf("unlabeled gateway is not visible")
+		}
+		return nil
+	})
+
+	g.Expect(controller.Reconcile(model.NewPushContext())).To(Succeed())
+	g.Expect(controller.List(gvk.Gateway, "ns1")).To(HaveLen(1))
+
+	gateway := store.Get(gvk.KubernetesGateway, "gwspec", "ns1")
+	gateway.Labels = map[string]string{"istio.io/rev": "1-20-3"}
+	if _, err := store.Update(*gateway); err != nil {
+		t.Fatal(err)
+	}
+	retry.UntilSuccessOrFail(t, func() error {
+		gateway := store.Get(gvk.KubernetesGateway, "gwspec", "ns1")
+		if gateway == nil {
+			return fmt.Errorf("gateway disappeared after moving to another revision")
+		}
+		if got := gateway.Labels["istio.io/rev"]; got != "1-20-3" {
+			return fmt.Errorf("gateway revision is %q, want 1-20-3", got)
+		}
+		return nil
+	})
+
+	g.Expect(controller.Reconcile(model.NewPushContext())).To(Succeed())
+	generated := controller.List(gvk.Gateway, "ns1")
+	g.Expect(generated).To(HaveLen(1))
+	g.Expect(generated[0].Name).To(Equal("gwspec-" + constants.KubernetesGatewayName + "-default"))
+	g.Expect(generated[0].Spec).To(Equal(expectedgw))
 }
 
 func TestNamespaceEvent(t *testing.T) {
