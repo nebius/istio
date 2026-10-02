@@ -23,6 +23,7 @@ import (
 	"go.uber.org/atomic"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"istio.io/api/meta/v1alpha1"
 	"istio.io/api/networking/v1alpha3"
@@ -416,6 +417,79 @@ func TestClientInitialSyncSkipsOtherRevisions(t *testing.T) {
 
 		assert.Equal(t, expected, cfgsAdded)
 	}
+}
+
+func TestClientKeepsKubernetesGatewayAcrossRevisionChanges(t *testing.T) {
+	fake := kube.NewFakeClient()
+	clienttest.MakeCRD(t, fake, collections.KubernetesGateway.GroupVersionResource())
+
+	writer := clienttest.NewWriter[*v1beta1.Gateway](t, fake)
+	gw := writer.Create(&v1beta1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gateway",
+			Namespace: "test",
+		},
+	})
+
+	schemas := collection.NewSchemasBuilder().MustAdd(collections.KubernetesGateway).Build()
+	store := NewForSchemas(fake, Option{Revision: "default"}, schemas)
+	stop := test.NewStop(t)
+	fake.RunAndWait(stop)
+	go store.Run(stop)
+	kube.WaitForCacheSync("test", stop, store.HasSynced)
+
+	retry.UntilSuccessOrFail(t, func() error {
+		if store.Get(gvk.KubernetesGateway, gw.Name, gw.Namespace) == nil {
+			return fmt.Errorf("unlabeled gateway is not visible")
+		}
+		return nil
+	})
+
+	updated := gw.DeepCopy()
+	updated.Labels = map[string]string{"istio.io/rev": "1-20-3"}
+	writer.Update(updated)
+
+	retry.UntilSuccessOrFail(t, func() error {
+		cfg := store.Get(gvk.KubernetesGateway, gw.Name, gw.Namespace)
+		if cfg == nil {
+			return fmt.Errorf("gateway disappeared after moving to another revision")
+		}
+		if got := cfg.Labels["istio.io/rev"]; got != "1-20-3" {
+			return fmt.Errorf("gateway revision is %q, want 1-20-3", got)
+		}
+		return nil
+	})
+}
+
+func TestClientIncludesKubernetesGatewayForOtherRevisionOnInitialSync(t *testing.T) {
+	fake := kube.NewFakeClient()
+	clienttest.MakeCRD(t, fake, collections.KubernetesGateway.GroupVersionResource())
+
+	gw := clienttest.NewWriter[*v1beta1.Gateway](t, fake).Create(&v1beta1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gateway",
+			Namespace: "test",
+			Labels:    map[string]string{"istio.io/rev": "1-20-3"},
+		},
+	})
+
+	schemas := collection.NewSchemasBuilder().MustAdd(collections.KubernetesGateway).Build()
+	store := NewForSchemas(fake, Option{Revision: "default"}, schemas)
+	stop := test.NewStop(t)
+	fake.RunAndWait(stop)
+	go store.Run(stop)
+	kube.WaitForCacheSync("test", stop, store.HasSynced)
+
+	retry.UntilSuccessOrFail(t, func() error {
+		cfg := store.Get(gvk.KubernetesGateway, gw.Name, gw.Namespace)
+		if cfg == nil {
+			return fmt.Errorf("gateway for revision 1-20-3 is not visible to revision default")
+		}
+		if got := cfg.Labels["istio.io/rev"]; got != "1-20-3" {
+			return fmt.Errorf("gateway revision is %q, want 1-20-3", got)
+		}
+		return nil
+	})
 }
 
 func TestClientSync(t *testing.T) {

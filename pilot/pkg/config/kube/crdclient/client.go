@@ -43,6 +43,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -352,6 +353,13 @@ func (cl *Client) addCRD(name string) {
 		}
 		if cl.namespacesFilter != nil && !cl.namespacesFilter(t) {
 			return false
+		}
+		// Gateways must remain visible to both the old and new control planes while
+		// their revision label changes. Gateway status writes are serialized by the
+		// cluster-wide leader, while deployment ownership is enforced separately by
+		// the Gateway deployment controller.
+		if resourceGVK == gvk.KubernetesGateway {
+			return true
 		}
 		return config.LabelsInRevision(t.(controllers.Object).GetLabels(), cl.revision)
 	}
